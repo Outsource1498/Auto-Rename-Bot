@@ -29,6 +29,10 @@ renaming_operations = {}
 # Per-user sequential episode counter {user_id: next_episode_number}
 episode_counters = {}
 
+# QUEUE: limit how many files download/upload at once. Others wait their turn.
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
+process_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
     # Standard patterns (S01E02, S01EP02)
@@ -163,6 +167,13 @@ async def set_episode(client, message):
 async def auto_rename_files(client, message):
     """Main handler for auto-renaming files"""
     user_id = message.from_user.id
+
+    # Lock in this file's episode number IMMEDIATELY (before any await) so a
+    # batch-forward is always numbered in the order the files arrived.
+    ep_num = episode_counters.get(user_id, 1)
+    episode_counters[user_id] = ep_num + 1
+    episode = str(ep_num).zfill(2)
+
     format_template = await codeflixbots.get_format_template(user_id)
     
     if not format_template:
@@ -199,16 +210,14 @@ async def auto_rename_files(client, message):
 
     download_path = metadata_path = thumb_path = None   # prevents cleanup crash
 
-    try:
-        # Extract season/quality from filename (episode is set by the counter)
-        season, _ = extract_season_episode(file_name)
-        quality = extract_quality(file_name)
+    # season/quality still come from the filename (episode is the counter above)
+    season, _ = extract_season_episode(file_name)
+    quality = extract_quality(file_name)
 
-        # --- sequential episode numbering, in forward order ---
-        ep_num = episode_counters.get(user_id, 1)
-        episode_counters[user_id] = ep_num + 1
-        episode = str(ep_num).zfill(2)
-        
+    # QUEUE: block here until a processing slot frees up (max MAX_CONCURRENT).
+    await process_semaphore.acquire()
+
+    try:
         # Replace placeholders in template
         replacements = {
             '{season}': season or 'XX',
@@ -244,14 +253,13 @@ async def auto_rename_files(client, message):
             await msg.edit(f"Download failed: {e}")
             raise
 
-        # Process metadata
+        # Process metadata (best-effort: if FFmpeg can't read it, upload anyway)
         await msg.edit("**Processing metadata...**")
         try:
             await add_metadata(file_path, metadata_path, user_id)
             file_path = metadata_path
         except Exception as e:
-            await msg.edit(f"Metadata processing failed: {e}")
-            raise
+            logger.warning(f"Metadata skipped for {new_filename}: {e}")
 
         # Prepare for upload
         await msg.edit("**Preparing upload...**")
@@ -294,6 +302,7 @@ async def auto_rename_files(client, message):
         logger.error(f"Processing error: {e}")
         await message.reply_text(f"Error: {str(e)}")
     finally:
+        process_semaphore.release()
         # Clean up files
         await cleanup_files(download_path, metadata_path, thumb_path)
         renaming_operations.pop(file_id, None)
