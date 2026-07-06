@@ -50,7 +50,12 @@ class Bot(Client):
         uptime_seconds = int(time.time() - self.start_time)
         uptime_string = str(timedelta(seconds=uptime_seconds))
 
-        for chat_id in [Config.LOG_CHANNEL, SUPPORT_CHAT]:
+        # Announce startup only to YOUR own LOG_CHANNEL (optional).
+        # The hardcoded developer SUPPORT_CHAT was removed so the bot no
+        # longer tries to post in a channel it isn't a member of.
+        for chat_id in [Config.LOG_CHANNEL]:
+            if not chat_id:
+                continue
             try:
                 curr = datetime.now(timezone("Asia/Kolkata"))
                 date = curr.strftime('%d %B, %Y')
