@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Global dictionary to track ongoing operations
 renaming_operations = {}
 
+# Per-user sequential episode counter {user_id: next_episode_number}
+episode_counters = {}
+
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
     # Standard patterns (S01E02, S01EP02)
@@ -58,8 +61,10 @@ def extract_season_episode(filename):
     for pattern, (season_group, episode_group) in SEASON_EPISODE_PATTERNS:
         match = pattern.search(filename)
         if match:
-            season = match.group(1) if season_group else None
-            episode = match.group(2) if episode_group else match.group(1)
+            if season_group and episode_group:
+                season, episode = match.group(1), match.group(2)
+            else:
+                season, episode = None, match.group(1)
             logger.info(f"Extracted season: {season}, episode: {episode} from {filename}")
             return season, episode
     logger.warning(f"No season/episode pattern matched for {filename}")
@@ -140,6 +145,20 @@ async def add_metadata(input_path, output_path, user_id):
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
 
+@Client.on_message(filters.private & filters.command("setepisode"))
+async def set_episode(client, message):
+    """Set the next episode number for this batch, e.g. /setepisode 1"""
+    try:
+        n = int(message.command[1])
+    except (IndexError, ValueError):
+        return await message.reply_text("Usage: `/setepisode 1`")
+    episode_counters[message.from_user.id] = n
+    await message.reply_text(
+        f"✅ Counter set. The next file you forward will be **E{n:02d}**, "
+        f"then it counts up automatically. Now forward your videos."
+    )
+
+
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_rename_files(client, message):
     """Main handler for auto-renaming files"""
@@ -178,10 +197,17 @@ async def auto_rename_files(client, message):
             return
     renaming_operations[file_id] = datetime.now()
 
+    download_path = metadata_path = thumb_path = None   # prevents cleanup crash
+
     try:
-        # Extract metadata from filename
-        season, episode = extract_season_episode(file_name)
+        # Extract season/quality from filename (episode is set by the counter)
+        season, _ = extract_season_episode(file_name)
         quality = extract_quality(file_name)
+
+        # --- sequential episode numbering, in forward order ---
+        ep_num = episode_counters.get(user_id, 1)
+        episode_counters[user_id] = ep_num + 1
+        episode = str(ep_num).zfill(2)
         
         # Replace placeholders in template
         replacements = {
